@@ -1,0 +1,3 @@
+# Core app: Python 3.10+ standard library only.
+# Optional, only for the Claude planner (otherwise the offline mock planner is used):
+anthropic>=0.40
