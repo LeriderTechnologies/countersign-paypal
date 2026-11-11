@@ -8,3 +8,11 @@ data/
 *.db
 .venv/
 video/out/*-clip.mp4
+video/tts/models/
+video/out/.finish-*/
+video/voice_ab/*.wav
+video/voice_ab/.work/
+video/tts/alt/*-venv/
+video/tts/alt/piper-models/
+video/tts/alt/*.log
+video/out/old/

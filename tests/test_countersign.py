@@ -325,12 +325,66 @@ class WebRender(unittest.TestCase):
         buy = by_source(cards, "msg-6")
         eng.approve(buy["id"], "alice", buy["digest"])
         page = render(eng.state(), "tok")
-        self.assertIn("Blocked by code because", page)
-        self.assertIn("the payee is not on the human-vetted list", page)
+        self.assertIn("It is over the $500 per-action limit", page)
+        self.assertIn("the payee is not on your vetted list", page)
+        self.assertIn("$4,900 is over the $500 limit", page)
+        self.assertNotIn("&lt;=", page)
+        self.assertNotIn("mock planner", page)
         self.assertIn('action="/pay"', page)
-        self.assertIn("agentic commerce", page)
+        self.assertIn("Agentic commerce", page)
         self.assertEqual(page.count("Approve (blocked)"), 2)
         self.assertNotIn("<script", page)
+
+    def test_audit_detail_reads_as_plain_english(self):
+        """The audit page describes events in words; the signed audit data itself is unchanged."""
+        from countersign.web import render_audit
+        eng = make_engine(tempfile.mkdtemp())
+        eng.audit.record("login", "alice", auth_method="password")
+        cards = eng.run_agent()
+        buy = by_source(cards, "msg-6")
+        eng.approve(buy["id"], "alice", buy["digest"])
+        raw = json.dumps(eng.audit.entries())
+        page = render_audit(eng.state(), "tok", "alice")
+        self.assertIn("Signed in with password", page)
+        self.assertRegex(page, r"Agent drafted \d+ actions, \d+ blocked by code")
+        self.assertIn("waiting for the buyer to approve in PayPal", page)
+        self.assertRegex(page, r"Chain verified · (\d+) of \1 entries")
+        for raw_text in ("auth method", "paypal_mode", "PAYER_ACTION_REQUIRED", "proposals "):
+            self.assertNotIn(raw_text, page)
+        self.assertIn("PAYER_ACTION_REQUIRED", raw)  # display only: the chain keeps the PayPal status code
+
+    def test_tabs_select_first_non_empty(self):
+        from countersign.web import render
+        eng = make_engine(tempfile.mkdtemp())
+        eng.run_agent()
+        for c in eng.state()["cards"]:
+            if c["status"] == "pending":
+                eng.reject(c["id"], "alice")
+        page = render(eng.state(), "tok")
+        self.assertIn('<span class="on">Blocked ·', page)
+
+    def test_edited_approval_record_shows_invalid(self):
+        """cards.json is plain JSON: an approver rewritten there must render as an invalid signature, not a name."""
+        from countersign.web import render
+        tmp = tempfile.mkdtemp()
+        eng = make_engine(tmp)
+        cards = eng.run_agent()
+        mug, shoot = by_source(cards, "msg-1"), by_source(cards, "msg-2")
+        for c in (mug, shoot):
+            eng.approve(c["id"], "alice", c["digest"], auth_method="password")
+        path = Path(tmp) / "cards.json"
+        data = json.loads(path.read_text())
+        for c in data:
+            if c["id"] == mug["id"]:
+                c["decided_by"] = c["approval"]["approver"] = "mallory"
+        path.write_text(json.dumps(data))
+        eng2 = make_engine(tmp)
+        self.assertEqual(eng2.state()["approval_invalid"], [mug["id"]])
+        page = render(eng2.state(), "tok")
+        self.assertNotIn("Approved by <b>mallory", page)
+        self.assertIn("Approval signature INVALID", page)
+        self.assertEqual(page.count("Approval signature INVALID"), 1)
+        self.assertIn("Approved by <b>alice (authenticated)</b>", page)  # the untouched card still verifies
 
 
 class SandboxFixes(unittest.TestCase):
@@ -410,6 +464,390 @@ class SandboxFixes(unittest.TestCase):
         curs |= {v["currency"] for v in pol.Policy().supplier_catalog.values()}
         curs |= {cur for m in pl_inbox() for _, cur in pl.AMOUNT_RE.findall(m["body"])}
         self.assertEqual(curs, {"USD"})
+
+
+class OwnInbox(unittest.TestCase):
+    """serve --inbox FILE: a shop's own messages (mail/helpdesk export) instead of the built-in sample."""
+    def test_load_inbox_and_run(self):
+        from countersign.inbox import load_inbox
+        msgs = load_inbox(Path(__file__).resolve().parent.parent / "docs" / "inbox.example.json")
+        self.assertEqual([m["id"] for m in msgs], ["mail-1001", "ticket-77"])
+        tmp = tempfile.mkdtemp()
+        eng = Engine(Path(tmp), MockPayPal(Path(tmp) / "mock.json"), pl.MockPlanner(), inbox=msgs)
+        cards = eng.run_agent()
+        self.assertEqual({c["source_id"] for c in cards}, {"mail-1001", "ticket-77"})
+        self.assertTrue(all(c["status"] in ("pending", "blocked") for c in cards))  # still propose-only
+
+    def test_bad_inbox_files_refused(self):
+        from countersign.inbox import load_inbox
+        d = Path(tempfile.mkdtemp())
+        for i, bad in enumerate(([], {"id": "x"}, [{"id": "a", "from": "b", "subject": "c"}],
+                                 [{"id": "a", "from": "b", "subject": "c", "body": "d"}] * 2)):
+            f = d / f"bad{i}.json"
+            f.write_text(json.dumps(bad))
+            with self.assertRaises(ValueError, msg=bad):
+                load_inbox(f)
+
+
+class AuthenticatedApprover(unittest.TestCase):
+    """The approver is a logged-in local account; identity comes only from the session."""
+    PW = "correct-horse-battery"
+
+    def setUp(self):
+        import http.client
+        import threading
+        from countersign.auth import Auth
+        from countersign.web import make_server
+        self.http = http.client
+        self.tmp = tempfile.mkdtemp()
+        self.eng = make_engine(self.tmp)
+        self.cards = self.eng.run_agent()
+        self.auth = Auth(Path(self.tmp), failure_delay=0)
+        self.auth.approvers.add("alice", self.PW)
+        self.srv = make_server(self.eng, 0, self.auth)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def req(self, method, path, form=None, cookie=None):
+        import urllib.parse
+        c = self.http.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        body = urllib.parse.urlencode(form or {})
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if cookie:
+            headers["Cookie"] = cookie
+        c.request(method, path, body if method == "POST" else None, headers)
+        r = c.getresponse()
+        return r.status, dict(r.getheaders()), r.read().decode()
+
+    def login(self, user="alice", pw=None):
+        st, h, _ = self.req("POST", "/login", {"login_token": self.auth.login_token(), "username": user,
+                                               "password": pw or self.PW})
+        return st, h
+
+    def session(self):
+        st, h = self.login()
+        self.assertEqual(st, 303)
+        cookie = h["Set-Cookie"].split(";")[0]
+        sid = cookie.split("=", 1)[1].split(".")[0]
+        return cookie, self.auth._sessions[sid].csrf
+
+    def pending(self, sid="msg-1"):
+        return by_source(self.cards, sid)
+
+    def test_password_hash_is_salted_scrypt(self):
+        from countersign.auth import check_password, hash_password
+        a, b = hash_password(self.PW), hash_password(self.PW)
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.startswith("scrypt$"))
+        self.assertTrue(check_password(self.PW, a))
+        self.assertFalse(check_password("wrong-password!", a))
+        raw = (Path(self.tmp) / "approvers.json").read_text()
+        self.assertNotIn(self.PW, raw)
+        self.assertEqual((Path(self.tmp) / "approvers.json").stat().st_mode & 0o077, 0)
+
+    def test_no_session_is_refused(self):
+        c = self.pending()
+        st, _, _ = self.req("POST", "/approve", {"card": c["id"], "digest": c["digest"], "csrf": "x", "who": "alice"})
+        self.assertEqual(st, 403)
+        self.assertEqual(self.eng.card(c["id"])["status"], "pending")
+        st, _, page = self.req("GET", "/")
+        self.assertIn('action="/login"', page)
+        self.assertNotIn(c["id"], page)
+        self.assertEqual(self.req("GET", "/api/state")[0], 401)
+        for path in ("/reject", "/pay", "/run", "/reset"):
+            self.assertEqual(self.req("POST", path, {"card": c["id"]})[0], 403, path)
+
+    def test_bad_or_missing_csrf_is_refused(self):
+        cookie, csrf = self.session()
+        c = self.pending()
+        for bad in ("", "x" * len(csrf)):
+            st, _, _ = self.req("POST", "/approve", {"card": c["id"], "digest": c["digest"], "csrf": bad}, cookie)
+            self.assertEqual(st, 403)
+        self.assertEqual(self.eng.card(c["id"])["status"], "pending")
+
+    def test_wrong_password_and_lockout(self):
+        st, h = self.login(pw="not-the-password")
+        self.assertEqual(st, 401)
+        self.assertNotIn("Set-Cookie", h)
+        self.assertEqual(self.login(user="nobody")[0], 401)
+        for _ in range(4):
+            self.login(pw="not-the-password")
+        self.assertEqual(self.login()[0], 401)  # locked even with the right password
+        self.assertTrue(any(a["event"] == "login_failed" for a in self.eng.audit.entries()))
+        st, _, _ = self.req("POST", "/login", {"login_token": "1.forged", "username": "alice", "password": self.PW})
+        self.assertEqual(st, 403)
+
+    def test_cookie_flags_and_logout(self):
+        st, h = self.login()
+        self.assertEqual(st, 303)
+        sc = h["Set-Cookie"]
+        for flag in ("HttpOnly", "SameSite=Strict", "Path=/"):
+            self.assertIn(flag, sc)
+        cookie, csrf = self.session()
+        self.assertIn("Signed in as <b>alice</b>", self.req("GET", "/", cookie=cookie)[2])
+        self.assertEqual(self.req("POST", "/logout", {"csrf": csrf}, cookie)[0], 303)
+        self.assertIn('action="/login"', self.req("GET", "/", cookie=cookie)[2])
+        forged = cookie.split(".")[0] + ".AAAA"
+        self.assertIn('action="/login"', self.req("GET", "/", cookie=forged)[2])
+
+    def test_identity_from_session_not_form_and_in_digest_and_audit(self):
+        cookie, csrf = self.session()
+        c = self.pending()
+        st, _, _ = self.req("POST", "/approve", {"card": c["id"], "digest": c["digest"], "csrf": csrf,
+                                                 "who": "mallory", "name": "mallory"}, cookie)
+        self.assertEqual(st, 303)
+        done = self.eng.card(c["id"])
+        self.assertEqual((done["status"], done["decided_by"], done["auth_method"]), ("executed", "alice", "password"))
+        ap = done["approval"]
+        self.assertEqual(ap["approval_digest"], self.eng.audit.approval_digest(c["id"], c["digest"], "alice", "password",
+                                                                         ap["approved_at"]))
+        entry = next(a for a in self.eng.audit.entries() if a["event"] == "card_approved")
+        self.assertEqual(entry["actor"], "alice")
+        self.assertEqual((entry["details"]["approver"], entry["details"]["auth_method"],
+                          entry["details"]["approval_digest"]), ("alice", "password", ap["approval_digest"]))
+        self.assertNotIn("mallory", json.dumps(self.eng.audit.entries()))
+        page = self.req("GET", "/", cookie=cookie)[2]
+        self.assertIn("Approved by <b>alice (authenticated)</b>", page)
+        self.assertNotIn('name="who"', page)
+        self.assertTrue(self.eng.audit.verify()[0])
+
+    def test_reject_and_pay_use_session_identity(self):
+        cookie, csrf = self.session()
+        bad = by_source(self.cards, "msg-4")
+        self.req("POST", "/reject", {"card": bad["id"], "csrf": csrf, "who": "mallory"}, cookie)
+        self.assertEqual(self.eng.card(bad["id"])["decided_by"], "alice")
+        buy = by_source(self.cards, "msg-6")
+        self.req("POST", "/approve", {"card": buy["id"], "digest": buy["digest"], "csrf": csrf}, cookie)
+        self.req("POST", "/pay", {"card": buy["id"], "csrf": csrf, "who": "mallory"}, cookie)
+        done = self.eng.card(buy["id"])
+        self.assertEqual((done["result"]["status"], done["paid_by"], done["paid_auth_method"]),
+                         ("COMPLETED", "alice", "password"))
+
+    def _approved_log(self):
+        cookie, csrf = self.session()
+        c = self.pending()
+        self.req("POST", "/approve", {"card": c["id"], "digest": c["digest"], "csrf": csrf}, cookie)
+        self.req("POST", "/run", {"csrf": csrf}, cookie)  # a few later entries to re-chain
+        log = Path(self.tmp) / "audit.jsonl"
+        rows = [json.loads(r) for r in log.read_text().splitlines()]
+        i = next(i for i, r in enumerate(rows) if r["event"] == "card_approved")
+        self.assertLess(i, len(rows) - 2)
+        return log, rows, i
+
+    @staticmethod
+    def _rewrite(log, rows, i, approval_key, mac_key):
+        """Attacker: rewrite the approver on line i, recompute its approval digest and EVERY later hash/prev link,
+        and re-sign each entry with `mac_key` (None = keep the old mac)."""
+        import hashlib
+        import hmac as hm
+        from countersign.audit import _digest, approval_digest
+        e = rows[i]
+        e["actor"] = e["details"]["approver"] = "mallory"
+        d = e["details"]
+        d["approval_digest"] = approval_digest(approval_key, d["card"], d["digest"], "mallory", d["auth_method"],
+                                               d["approved_at"])
+        prev = rows[i - 1]["hash"] if i else "0" * 64
+        for r in rows[i:]:
+            r["prev"] = prev
+            r["hash"] = _digest(r)
+            if mac_key is not None:
+                r["mac"] = hm.new(mac_key, ("audit-entry:" + r["hash"]).encode(), hashlib.sha256).hexdigest()
+            prev = r["hash"]
+        log.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+
+    def test_tampered_approver_breaks_chain(self):
+        log, rows, i = self._approved_log()
+        self.assertTrue(self.eng.audit.verify()[0])
+        e = json.loads(json.dumps(rows[i]))
+        e["actor"] = e["details"]["approver"] = "mallory"
+        bad = list(rows)
+        bad[i] = e
+        log.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in bad))
+        self.assertFalse(self.eng.audit.verify()[0])
+
+    def test_rewriting_whole_tail_without_key_fails(self):
+        """Change the approver AND recompute every later hash. Without data/audit.key this must fail,
+        whether the attacker keeps the old HMACs, signs with a guessed key, or uses an unkeyed digest."""
+        import copy
+        log, rows, i = self._approved_log()
+        guess = b"\x00" * 32
+        for approval_key, mac_key in ((guess, None), (guess, guess), (b"", b"")):
+            self._rewrite(log, copy.deepcopy(rows), i, approval_key, mac_key)
+            ok, msg = self.eng.audit.verify()
+            self.assertFalse(ok, (approval_key, mac_key))
+            self.assertIn(f"line {i + 1}:", msg)
+            self.assertIn("HMAC", msg)
+        # Stripping every signature and re-chaining with plain SHA-256 fails too (no unsigned-entry downgrade).
+        plain = copy.deepcopy(rows)
+        for r in plain:
+            r.pop("mac", None)
+        self._rewrite(log, plain, i, guess, None)
+        self.assertFalse(self.eng.audit.verify()[0])
+        # The documented limit: whoever holds the key file can re-sign a rewritten log.
+        self._rewrite(log, copy.deepcopy(rows), i, self.eng.audit.key, self.eng.audit.key)
+        self.assertEqual(self.eng.audit.verify(), (True, "chain intact"))
+
+    def test_audit_key_is_private_and_reused(self):
+        from countersign.audit import AuditLog
+        d = Path(tempfile.mkdtemp())
+        a = AuditLog(d / "audit.jsonl")
+        self.assertEqual((d / "audit.key").stat().st_mode & 0o777, 0o600)
+        a.record("x", "agent")
+        self.assertEqual(AuditLog(d / "audit.jsonl").key, a.key)  # same key after restart
+        self.assertEqual(AuditLog(d / "audit.jsonl").verify(), (True, "chain intact"))
+        self.assertNotEqual(AuditLog(d / "other" / "audit.jsonl").key, a.key)  # a new install gets its own key
+
+    def test_non_ascii_tokens_do_not_crash(self):
+        """hmac.compare_digest(str, str) used to raise TypeError on non-ASCII cookie/csrf/login_token."""
+        self.assertFalse(self.auth.check_login_token("1.\u00e9"))
+        self.assertFalse(self.auth.check_login_token("\u0661\u0662.x"))  # non-ASCII digits
+        self.assertIsNone(self.auth.session("cs_session=x.\u00e9"))
+        cookie, csrf = self.session()
+        s = self.auth.session(cookie)
+        self.assertFalse(self.auth.csrf_ok(s, "\u00e9"))
+        st, _, page = self.req("GET", "/", cookie="cs_session=x.\u00e9")
+        self.assertEqual(st, 200)
+        self.assertIn('action="/login"', page)
+        st, _, _ = self.req("POST", "/login", {"login_token": "1.\u00e9", "username": "alice", "password": self.PW})
+        self.assertEqual(st, 403)
+        c = self.pending()
+        st, _, _ = self.req("POST", "/approve", {"card": c["id"], "digest": c["digest"], "csrf": "\u00e9"}, cookie)
+        self.assertEqual(st, 403)
+
+    def test_client_and_global_throttle_and_capped_store(self):
+        """Many names from one client lock that client; the failure store stays bounded."""
+        from countersign import auth as A
+        for k in range(A.MAX_CLIENT_FAILS):
+            self.assertEqual(self.login(user=f"guess{k}", pw="nope-nope-nope")[0], 401)
+        self.assertEqual(self.login()[0], 401)  # this client is locked, even for a right password
+        self.assertIsNotNone(self.auth.login("alice", self.PW, client="10.0.0.9"))  # another client is not
+        old = A.MAX_TRACKED
+        A.MAX_TRACKED = 10
+        try:
+            for k in range(25):
+                with self.assertRaises(A.AuthError):
+                    self.auth.login(f"n{k}", "x", client=f"10.1.{k}.1")
+            self.assertLessEqual(len(self.auth._fails), 10)
+        finally:
+            A.MAX_TRACKED = old
+        self.assertTrue(self.auth._gate.acquire(blocking=False))  # the global gate is free between logins
+        self.auth._gate.release()
+
+    def test_global_gate_serialises_password_checks(self):
+        import threading
+        import time
+        from countersign.auth import Auth, AuthError
+        slow = Auth(Path(self.tmp), failure_delay=0.2)
+        t0 = time.time()
+
+        def guess(k):
+            try:
+                slow.login("alice", f"wrong-{k}", client=f"10.2.{k}.1")
+            except AuthError:
+                pass
+        th = [threading.Thread(target=guess, args=(k,)) for k in range(4)]
+        for t in th:
+            t.start()
+        for t in th:
+            t.join()
+        self.assertGreaterEqual(time.time() - t0, 0.75)  # 4 parallel guesses take >= 4 x delay, not 1 x
+
+    def test_removed_approver_loses_session(self):
+        """remove-approver ends that approver's live sessions."""
+        cookie, csrf = self.session()
+        self.assertIn("Signed in as <b>alice</b>", self.req("GET", "/", cookie=cookie)[2])
+        self.assertTrue(self.auth.approvers.remove("alice"))
+        self.assertIn('action="/login"', self.req("GET", "/", cookie=cookie)[2])
+        c = self.pending()
+        st, _, _ = self.req("POST", "/approve", {"card": c["id"], "digest": c["digest"], "csrf": csrf}, cookie)
+        self.assertEqual(st, 403)
+        self.assertEqual(self.eng.card(c["id"])["status"], "pending")
+        self.assertFalse(any(x.user == "alice" for x in self.auth._sessions.values()))
+
+    def test_failed_login_does_not_log_typed_secret(self):
+        """A password typed into the name field must not reach the audit log."""
+        self.login(user="Hunter2-secret-pass", pw="x")
+        self.login(user="alice", pw="wrong-password-1")
+        rows = [a for a in self.eng.audit.entries() if a["event"] == "login_failed"]
+        self.assertNotIn("hunter2", json.dumps(self.eng.audit.entries()).lower())
+        self.assertTrue(rows[0]["details"]["username"].startswith("unknown user #"))
+        self.assertEqual(rows[1]["details"]["username"], "alice")
+
+    def test_msg_param_only_shows_fixed_messages(self):
+        """?msg= free text is not rendered (no content spoofing); details come from the session."""
+        cookie, csrf = self.session()
+        page = self.req("GET", "/?msg=Approved%20by%20bob", cookie=cookie)[2]
+        self.assertNotIn("Approved by bob", page)
+        self.assertNotIn("Approved by bob", self.req("GET", "/?msg=Approved%20by%20bob")[2])
+        self.assertIn("Signed in.", self.req("GET", "/?msg=signed_in", cookie=cookie)[2])
+        c = self.pending()
+        st, h, _ = self.req("POST", "/approve", {"card": c["id"], "digest": c["digest"], "csrf": csrf}, cookie)
+        self.assertEqual(h["Location"], "/?msg=flash")
+        page = self.req("GET", "/?msg=flash", cookie=cookie)[2]
+        self.assertIn(f"{c['id']}: executed, approved by alice (authenticated)", page)
+        self.assertNotIn(f"{c['id']}: executed, approved", self.req("GET", "/?msg=flash", cookie=cookie)[2])  # once
+
+    def test_malformed_post_gets_a_response(self):
+        """A non-numeric Content-Length is a 400; a body that is not UTF-8 is decoded with replacement, not a crash."""
+        for headers, body in (({"Content-Length": "abc"}, b""),
+                              ({"Content-Length": "9"}, b"username=\xff\xfe&x")):
+            c = self.http.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            c.putrequest("POST", "/login")
+            c.putheader("Content-Type", "application/x-www-form-urlencoded")
+            for k, v in headers.items():
+                c.putheader(k, v)
+            c.endheaders()
+            if body:
+                c.send(body)
+            r = c.getresponse()
+            self.assertIn(r.status, (400, 401, 403))
+            r.read()
+        self.assertEqual(self.login()[0], 303)  # the server is still up
+
+    def test_login_field_has_no_spellcheck(self):
+        page = self.req("GET", "/")[2]
+        self.assertIn('spellcheck="false"', page)
+        self.assertIn("in someone else's name", page)
+
+    def test_scrypt_cost_and_login_time(self):
+        import time
+        from countersign.auth import SCRYPT
+        self.assertEqual(SCRYPT["n"], 2 ** 17)
+        t0 = time.time()
+        self.assertIsNotNone(self.auth.login("alice", self.PW))
+        self.assertLess(time.time() - t0, 1.0)
+
+    def test_account_rules_and_cli(self):
+        import io
+        import os
+        import sys
+        from countersign.__main__ import main
+        from countersign.auth import AuthError
+        for bad in ("agent", "system", "a", "Bad Name!"):
+            with self.assertRaises(AuthError, msg=bad):
+                self.auth.approvers.add(bad, self.PW)
+        with self.assertRaises(AuthError):
+            self.auth.approvers.add("bob", "short")
+        d = tempfile.mkdtemp()
+        old_env, old_in, old_out = os.environ.get("COUNTERSIGN_DATA_DIR"), sys.stdin, sys.stdout
+        os.environ["COUNTERSIGN_DATA_DIR"] = d
+        sys.stdin, sys.stdout = io.StringIO(self.PW + "\n"), io.StringIO()
+        try:
+            self.assertEqual(main(["add-approver", "Carol", "--password-stdin"]), 0)
+            out = sys.stdout.getvalue()
+        finally:
+            sys.stdin, sys.stdout = old_in, old_out
+            if old_env is None:
+                os.environ.pop("COUNTERSIGN_DATA_DIR")
+            else:
+                os.environ["COUNTERSIGN_DATA_DIR"] = old_env
+        self.assertNotIn(self.PW, out)
+        from countersign.auth import Approvers
+        self.assertTrue(Approvers(Path(d)).check("carol", self.PW))
 
 
 def pl_inbox():

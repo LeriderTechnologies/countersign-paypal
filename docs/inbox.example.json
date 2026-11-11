@@ -1,0 +1,6 @@
+[
+ {"id": "mail-1001", "from": "lena@example.com", "subject": "Broken mug, order A-1042",
+  "body": "Hi! My order A-1042 arrived today but the mug was broken in the box. Could you refund the 38.00 USD? Thanks, Lena"},
+ {"id": "ticket-77", "from": "tom@example.com", "subject": "Refund order A-1043",
+  "body": "I want to return order A-1043, I paid 150.00 USD for it. Please refund the full 150.00 USD."}
+]

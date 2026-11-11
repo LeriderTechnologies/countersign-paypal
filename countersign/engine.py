@@ -11,6 +11,7 @@ Card lifecycle:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import threading
 import uuid
@@ -187,20 +188,26 @@ class Engine:
                 c["status"] = "expired"
                 self.audit.record("card_expired", "system", card=c["id"])
 
-    def reject(self, card_id: str, who: str, note: str = "") -> dict:
+    def reject(self, card_id: str, who: str, note: str = "", auth_method: str = "direct-call") -> dict:
         with self._lock:
             self._expire()
             c = self.card(card_id)
             if c["status"] not in ("pending", "blocked"):
                 raise DecisionError(f"card is {c['status']}, cannot reject")
             c.update(status="rejected", decided_by=who, decided_at=now().isoformat(timespec="seconds"),
-                     decision_note=note)
+                     decision_note=note, auth_method=auth_method)
             self._save()
-            self.audit.record("card_rejected", who, card=card_id, note=note)
+            self.audit.record("card_rejected", who, card=card_id, auth_method=auth_method, note=note)
             return c
 
-    def approve(self, card_id: str, who: str, shown_digest: str, note: str = "") -> dict:
-        """Approve and execute. `shown_digest` is the digest the human saw; it must still match."""
+    def approve(self, card_id: str, who: str, shown_digest: str, note: str = "",
+                auth_method: str = "direct-call") -> dict:
+        """Approve and execute. `shown_digest` is the digest the human saw; it must still match.
+
+        `who` and `auth_method` come from the caller's authenticated context (the web UI passes the
+        session's user and "password"); they go into the approval digest (HMAC-SHA256 under the server key
+        data/audit.key) and into the audit entry, which is itself HMAC-signed.
+        """
         with self._lock:
             self._expire()
             c = self.card(card_id)
@@ -224,8 +231,12 @@ class Engine:
                 self.audit.record("approval_refused", who, card=card_id, reason="re-check failed", failed=failed)
                 raise DecisionError("re-check at execution time failed: " + ", ".join(failed))
 
-            c.update(decided_by=who, decided_at=now().isoformat(timespec="seconds"), decision_note=note)
-            self.audit.record("card_approved", who, card=card_id, digest=c["digest"], note=note)
+            at = now().isoformat(timespec="seconds")
+            sig = self.audit.approval_digest(card_id, c["digest"], who, auth_method, at)
+            c.update(decided_by=who, decided_at=at, decision_note=note, auth_method=auth_method,
+                     approval={"approver": who, "auth_method": auth_method, "approved_at": at, "approval_digest": sig})
+            self.audit.record("card_approved", who, card=card_id, digest=c["digest"], approver=who,
+                              auth_method=auth_method, approved_at=at, approval_digest=sig, note=note)
             return self._execute(c)
 
     def _execute(self, c: dict) -> dict:
@@ -254,7 +265,7 @@ class Engine:
         self._save()
         return c
 
-    def complete_purchase(self, card_id: str, who: str) -> dict:
+    def complete_purchase(self, card_id: str, who: str, auth_method: str = "direct-call") -> dict:
         """Capture an approved purchase order once the owner has paid it at PayPal.
 
         In mock mode there is no PayPal page to log in to, so the payer approval is simulated and
@@ -273,7 +284,7 @@ class Engine:
             try:
                 if isinstance(self.paypal, MockPayPal):
                     self.paypal.simulate_payer_approval(order_id)
-                    self.audit.record("payer_approval_simulated", who, card=card_id, order=order_id,
+                    self.audit.record("payer_approval_simulated", who, card=card_id, order=order_id, auth_method=auth_method,
                                       note="mock mode: stands in for paying at PayPal")
                 res = self.paypal.capture_order(order_id, c["id"] + "-capture")
                 if "purchase_units" in res:
@@ -282,8 +293,10 @@ class Engine:
                 self.audit.record("purchase_capture_failed", who, card=card_id, error=str(err), debug_id=err.debug_id)
                 raise DecisionError(f"PayPal: {err}") from None
             c["result"] = {**c["result"], **res, "approve_url": c["result"].get("approve_url")}
+            c["paid_by"], c["paid_auth_method"] = who, auth_method
             self._save()
-            self.audit.record("purchase_paid", who, card=card_id, order=order_id, capture=res.get("capture_id"))
+            self.audit.record("purchase_paid", who, card=card_id, order=order_id, capture=res.get("capture_id"),
+                              auth_method=auth_method)
             return c
 
     # ---------------------------------------------------------------- views
@@ -291,8 +304,10 @@ class Engine:
         with self._lock:
             self._expire()
             ok, msg = self.audit.verify()
+            entries = self.audit.entries()
             return {"paypal_mode": self.paypal.mode, "planner": self.planner.name, "inbox": self.inbox,
-                    "cards": self.cards, "notes": self.notes, "audit": self.audit.entries()[-40:],
+                    "cards": self.cards, "notes": self.notes, "audit": entries[-40:], "audit_count": len(entries),
+                    "approval_invalid": [c["id"] for c in self.cards if not self.approval_valid(c)],
                     "audit_ok": ok, "audit_msg": msg,
                     "outflow_today": fmt(self._outflow_today()) if self._outflow_today() else "0.00",
                     "policy": {"max_per_action": {k: fmt(v) for k, v in self.policy.max_per_action.items()},
@@ -301,11 +316,24 @@ class Engine:
                                "catalog": self.supplier_catalog(),
                                "currencies": sorted(self.policy.currencies)}}
 
-    def reset(self) -> None:
+    def approval_valid(self, c: dict) -> bool:
+        """A card that shows an approver must carry an approval record whose HMAC (server key) matches it.
+        cards.json is plain JSON on disk: an edited approver/decided_by must show as invalid, not as a signature."""
+        if not c.get("decided_by") or c.get("status") == "rejected":
+            return True
+        ap = c.get("approval") or {}
+        try:
+            want = self.audit.approval_digest(c["id"], c["digest"], ap["approver"], ap["auth_method"], ap["approved_at"])
+        except (KeyError, TypeError):
+            return False
+        return (hmac.compare_digest(want, str(ap.get("approval_digest", ""))) and ap["approver"] == c["decided_by"]
+                and ap["auth_method"] == c.get("auth_method"))
+
+    def reset(self, who: str = "human") -> None:
         with self._lock:
             self.cards = []
             self.notes = []
             self._save()
             if isinstance(self.paypal, MockPayPal):
                 self.paypal.reset()
-            self.audit.record("demo_reset", "human")
+            self.audit.record("demo_reset", who)

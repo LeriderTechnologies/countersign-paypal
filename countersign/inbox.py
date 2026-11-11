@@ -25,3 +25,24 @@ DEMO_INBOX = [
      "body": "Stock alert: espresso cup blanks (SKU BLANK-ESP-6) are down to 2 boxes after the Blue Harbor "
              "order, below the reorder point of 6. Suggested reorder: 5 boxes of BLANK-ESP-6 from the usual supplier."},
 ]
+
+
+def load_inbox(path) -> list[dict]:
+    """Your own inbox instead of the demo: a JSON file with a list of messages, each
+    {"id": "...", "from": "...", "subject": "...", "body": "..."} (export them from your mail or helpdesk).
+    The text is untrusted input to the agent, exactly like the demo messages."""
+    import json
+    from pathlib import Path
+
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, list) or not data:
+        raise ValueError("inbox file must be a non-empty JSON list of messages")
+    seen, out = set(), []
+    for i, m in enumerate(data, 1):
+        if not isinstance(m, dict) or not all(isinstance(m.get(k), str) and m.get(k) for k in ("id", "from", "subject", "body")):
+            raise ValueError(f"message {i}: needs non-empty string fields id, from, subject, body")
+        if m["id"] in seen:
+            raise ValueError(f"message {i}: duplicate id {m['id']!r}")
+        seen.add(m["id"])
+        out.append({k: m[k] for k in ("id", "from", "subject", "body")})
+    return out
