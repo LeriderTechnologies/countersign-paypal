@@ -78,7 +78,7 @@ def load_settings(data_dir: Path | None = None, env: dict[str, str] | None = Non
         paypal_client_id=merged.get("PAYPAL_CLIENT_ID", ""),
         paypal_client_secret=merged.get("PAYPAL_CLIENT_SECRET", ""),
         anthropic_api_key=merged.get("ANTHROPIC_API_KEY", ""),
-        anthropic_model=merged.get("ANTHROPIC_MODEL", "") or "claude-opus-5",
+        anthropic_model=merged.get("ANTHROPIC_MODEL", "") or "claude-opus-5-5",
         planner_choice=merged.get("COUNTERSIGN_PLANNER", "").lower(),
         replay_path=Path(merged.get("COUNTERSIGN_REPLAY") or ROOT / "docs" / "claude_run.json"),
         supplier_email=merged.get("COUNTERSIGN_SUPPLIER_EMAIL", "").strip().lower(),

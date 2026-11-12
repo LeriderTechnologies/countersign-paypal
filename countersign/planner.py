@@ -216,7 +216,7 @@ class ClaudePlanner:
     def _create(self, messages: list[dict]):
         return self.client.messages.create(
             model=self.model, max_tokens=16000, system=SYSTEM_PROMPT, tools=TOOL_SCHEMAS,
-            thinking={"type": "adaptive"}, messages=messages)
+            thinking={"type": "adaptive"}, output_config={"effort": "high"}, messages=messages)
 
     def plan(self, inbox: list[dict], tools: ReadTools) -> list[dict]:
         proposals: list[dict] = []

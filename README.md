@@ -116,8 +116,9 @@ When Claude is the planner, every run's tool calls are saved to `data/claude_run
 only, no keys). Copied to `docs/claude_run.json`, that run can be replayed offline:
 `python3 -m countersign demo --replay` or `serve --fresh --replay`. Replay goes through exactly the same
 rules and verification as a live run, so an edited recording is still blocked (tested).
-**Status: no recorded Claude run is committed yet** (it needs an Anthropic key); until then `--replay` falls
-back to the offline planner and says so.
+**A recorded run is committed** (`docs/claude_run.json`, Claude Opus 5.5, 2026-11-12, mock PayPal): Claude refused
+the CEO-fraud mail on its own and capped the A-1043 refund at the 120.00 USD PayPal actually captured. Without
+the file, `--replay` falls back to the offline planner and says so.
 
 ### With the PayPal sandbox and Claude
 
@@ -257,7 +258,8 @@ inbox ─► planner (Claude | mock) ──read-only──► PayPal GET (sandbo
   execution time, and the log is tamper-evident.
 - **Agentic commerce:** the agent also *buys*: a stock alert becomes a supplier purchase proposal, priced
   from a human-vetted catalogue, paid through a PayPal checkout order that the owner signs twice.
-- **Presentation:** the demo video on the Devpost page shows the CEO-fraud and wrong-amount cards being blocked live.
+- **Presentation:** the demo video on the Devpost page runs Claude (Opus 5.5) live against the PayPal sandbox: Claude
+  refuses the CEO-fraud mail and the over-claimed refund itself, and code checks every card it does propose.
 
 ## Limits (honest)
 
